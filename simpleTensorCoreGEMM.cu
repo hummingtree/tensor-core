@@ -74,7 +74,8 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 
 	__syncthreads();
 
-	sm_b[threadIdx.y*blockDim.x+threadIdx.x] = b[threadIdx.y*blockDim.x*gridDim.x+global_n];
+//	sm_b[threadIdx.y*blockDim.x+threadIdx.x] = b[threadIdx.y*blockDim.x*gridDim.x+global_n];
+	sm_b[threadIdx.x*blockDim.y+threadIdx.y] = b[global_n*blockDim.y+threadIdx.y];
 	
 	__syncthreads();
 
@@ -106,7 +107,8 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 	__syncthreads();
 
 // Store result to global memory
-	c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
+//	c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
+	c[global_n*blockDim.y+threadIdx.y] = sm_c[threadIdx.x*blockDim.y+threadIdx.y];
 
 }
 
