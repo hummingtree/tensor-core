@@ -29,9 +29,10 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M 48 // 12 x 4
-#define MATRIX_N 13824 // 16x12x12x12
-#define MATRIX_K 48 // MATRIX_M
+#define MATRIX_M 16 // 12 x 4
+#define MATRIX_N 16*12*12*12 // 16x12x12x12
+//#define MATRIX_N 16 // 16x12x12x12
+#define MATRIX_K 16 // MATRIX_M
 
 
 
@@ -49,100 +50,47 @@ const int WMMA_K = 16;
 //       For a high performance code please use the GEMM provided in cuBLAS.
 __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta) {
 
-	typedef cutlass::gemm::WmmaGemmTraits<
-		cutlass::MatrixLayout::kColumnMajor,
-		cutlass::MatrixLayout::kRowMajor, 
-		cutlass::Shape<48, 48, 32>, half
-		> WmmaGemmTraits;
-
-	typedef cutlass::gemm::Gemm<WmmaGemmTraits> Gemm;
+	extern __shared__ float4 sm[];
 	
-	int global_n = blockIdx.x * blockDim.x + threadIdx.x;
-	int global_k = blockIdx.y * blockDim.y + threadIdx.y;
+	int global_n = blockIdx.x*blockDim.x+threadIdx.x;
 
-	__shared__ typename Gemm::SharedStorage shared_storage;
-// Copy the global memory staff into shared memory.
+	half* sm_a = ((half*)sm)+16*16*4;
+	half* sm_b = sm_a + M*K;
+	half* sm_c = sm_b + M*K;
 
-	Gemm::SharedStorage ptr_a = shared_storage;
-	Gemm::SharedStorage ptr_b = ptr_a + blockDim.y*blockDim.y;
-	Gemm::SharedStorage ptr_c = ptr_b + blockDim.y*blockDim.x;
+	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
+
+  // Initialize the output to zero
+  wmma::fill_fragment(c_frag, (half)0.0f);
 
 	if(threadIdx.x == 0){
-		for(int k = 0; k < 48; k++){
-			ptr_a[threadIdx.y*48+k] = a[threadIdx.y*48+k];
-		}
-	}
-	
-	ptr_b[threadIdx.y*32+threadIdx.x] = b[threadIdx.y*32*blockDim.x+threadIdx.x];
-
-
-	typename Gemm::Params params;
-	params.initialize( M, N, K, alpha, ptr_A, lda, ptr_B, ldb, beta, ptr_C, ldc, ptr_D, ldd );
-	
-	Gemm gemm(params, shared_storage);
-
-	gemm.multiply_add();
-	
-	// Leading dimensions. Packed with no transpositions.
-	int lda = M;
-	int ldb = K;
-	int ldc = M;
-
-	// Tile using a 2D grid
-	int warpM = blockIdx.x * blockDim.x + threadIdx.x;
-	int warpN = blockIdx.y * blockDim.y + threadIdx.y;
-
-	// Declare the fragments
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
-	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-	wmma::fill_fragment(acc_frag, 0.0f);
-
-	//loop over the pieces.
-	for(int m = 0; m < blockDim.x/WMMA_M; m++){
-		for(int n = 0; n < blockDim.y/WMMA_N; n++){
-			for(int k = 0; k < blockDim.y/WMMA_K; k++){
-
-			}
-		}}
-
-	// Loop over k
-	for (int i = 0; i < K; i += WMMA_K) {
-		int aRow = warpM * WMMA_M;
-		int aCol = i;
-
-		int bRow = i;
-		int bCol = warpN * WMMA_N;
-
-		// Bounds checking
-		if (aRow < M && aCol < K && bRow < K && bCol < N) {
-			// Load the inputs
-			wmma::load_matrix_sync(a_frag, a + aRow + aCol * lda, lda);
-			wmma::load_matrix_sync(b_frag, b + bRow + bCol * ldb, ldb);
-
-			// Perform the matrix multiplication
-			wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-
+		for(int k = 0; k < blockDim.y; k++){
+			sm_a[threadIdx.y*blockDim.y+k] = a[threadIdx.y*blockDim.y+k];
 		}
 	}
 
-	// Load in the current value of c, scale it by beta, and add this our result scaled by alpha
-	int cRow = warpM * WMMA_M;
-	int cCol = warpN * WMMA_N;
+	__syncthreads();
 
-	if (cRow < M && cCol < N) {
-		wmma::load_matrix_sync(c_frag, c + cRow + cCol * ldc, ldc, wmma::mem_col_major);
+	sm_b[threadIdx.y*blockDim.x+threadIdx.x] = b[threadIdx.y*blockDim.x*gridDim.x+global_n];
+	
+	__syncthreads();
 
+  // Load the inputs
+  wmma::load_matrix_sync(a_frag, sm_a, 16);
+  wmma::load_matrix_sync(b_frag, sm_b, 16);
 
-		for(int i=0; i < c_frag.num_elements; i++) {
-			c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
-		}
+  // Perform the matrix multiplication
+  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 
-		// Store the output
-		wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag, ldc, wmma::mem_col_major);
-	}
+  // Store the output
+  wmma::store_matrix_sync(sm_c, c_frag, 16, wmma::mem_col_major);
+
+	__syncthreads();
+	
+	c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
+
 }
 
 __global__ void convertFp32ToFp16 (half *out, float *in, int n) {
@@ -215,8 +163,8 @@ int main(int argc, char* argv[]) {
 	cudaErrCheck(cudaMemcpy(c_cublas, c, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToDevice));
 	cudaErrCheck(cudaMemcpy(c_wmma, c, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToDevice));
 
-	float alpha = 2.0f;
-	float beta = 2.0f;
+	float alpha = 1.0f;
+	float beta = 0.0f;
 
 
 	printf("\nM = %d, N = %d, K = %d. alpha = %f, beta = %f\n\n", MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta);
@@ -227,15 +175,15 @@ int main(int argc, char* argv[]) {
 
 	// blockDim.x must be a multple of warpSize
 	// 128x4 means we have 16 warps and a block computes a 64x64 output tile
-	blockDim.x = 32;
-	blockDim.y = MATRIX_N;
+	blockDim.x = 16;
+	blockDim.y = MATRIX_M;
 
-	gridDim.x = (MATRIX_M + blockDim.x-1) / blockDim.x;
+	gridDim.x = (MATRIX_N + blockDim.x-1) / blockDim.x;
 	gridDim.y = 1;
 
 	printf("Running with wmma...\n");
 	cudaErrCheck(cudaEventRecord(startWMMA));
-	wmma_example <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta);
+	wmma_example <<< gridDim, blockDim, 16*16*2*8 >>> (a_fp16, b_fp16, c_wmma, 16, 16, 16, alpha, beta);
 	cudaErrCheck(cudaEventRecord(stopWMMA));
 
 
@@ -263,9 +211,9 @@ int main(int argc, char* argv[]) {
 	for (int i = 0; i < MATRIX_M * MATRIX_N; i++) {
 		float v1 = c_host_wmma[i];
 		float v2 = c_host_cublas[i];
-		if (v1 / v2 > 1.0001 || v2 / v1 > 1.0001 || abs(v1 - v2) > 1e-5) {
+		if (v1 / v2 > 1.01 || v2 / v1 > 1.01 || abs(v1 - v2) > 1e-2) {
 			errors++;
-			if (errors < 10) printf("%f %f\n", v1, v2);
+			if (errors < 300) printf("%06d %f %f\n", i, v1, v2);
 		}
 	}
 
