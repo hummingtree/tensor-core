@@ -29,18 +29,15 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M 16 // 12 x 4
+#define MATRIX_M 48 // 12 x 4
 #define MATRIX_N 16*12*12*12 // 16x12x12x12
 //#define MATRIX_N 16 // 16x12x12x12
-#define MATRIX_K 16 // MATRIX_M
-
-
+#define MATRIX_K 48 // MATRIX_M
 
 // The only dimensions currently supported by WMMA
 const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
-
 
 // Performs an MxNxK GEMM (C=alpha*A*B + beta*C) assuming:
 //  1) Matrices are packed in memory.
@@ -49,21 +46,25 @@ const int WMMA_K = 16;
 // Note: This is NOT a high performance example but is for demonstration purposes only
 //       For a high performance code please use the GEMM provided in cuBLAS.
 __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta) {
-
-	extern __shared__ float4 sm[];
 	
-	int global_n = blockIdx.x*blockDim.x+threadIdx.x;
+// M, N, K are the block-wise matrix dim.
+	int tm_dim = M/WMMA_M; // tile dimension in m.
+	int tn_dim = N/WMMA_N;
+	int tk_dim = K/WMMA_K;
+
+// Declare all shared memory.
+	extern __shared__ float4 sm[];
 
 	half* sm_a = (half*)sm;
 	half* sm_b = sm_a + M*K;
-	float* sm_c = (float*)(sm_b + M*K);
+	float* sm_c = (float*)(sm_b + K*N);
 
-	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+	half* wmma_a = (half*)(sm_c + M*N);
+	half* wmma_b = wmma_a + WMMA_M*WMMA_K;
+	float* wmma_c = (float*)(wmma_b + WMMA_K*WMMA_N);
 
-  // Initialize the output to zero
-  wmma::fill_fragment(c_frag, 0.0f);
+// Copy stuff from global memory to shared memory.
+	int global_n = blockIdx.x*blockDim.x+threadIdx.x;
 
 	if(threadIdx.x == 0){
 		for(int k = 0; k < blockDim.y; k++){
@@ -77,18 +78,34 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 	
 	__syncthreads();
 
-  // Load the inputs
-  wmma::load_matrix_sync(a_frag, sm_a, 16);
-  wmma::load_matrix_sync(b_frag, sm_b, 16);
-
-  // Perform the matrix multiplication
-  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-  // Store the output
-  wmma::store_matrix_sync(sm_c, c_frag, 16, wmma::mem_col_major);
-
+// Set up the wmma stuff
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
+  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+	for( int tm = 0; tm < tm_dim; tm++ ){
+	for( int tn = 0; tn < tn_dim; tn++ ){
+		// Initialize the output to zero
+  	wmma::fill_fragment(c_frag, 0.0f);
+		// for this particular tile, loop over k
+		for( int tk = 0; tk < tk_dim; tk++ ){
+			// Copy (tm,tk) tile from sm_a to wmma_a
+			...
+			// Copy (tk,tn) tile from sm_b to wmma_b
+			...
+			// Load the inputs
+		  wmma::load_matrix_sync(a_frag, wmma_a, WMMA_M);
+		  wmma::load_matrix_sync(b_frag, wmma_b, WMMA_K);
+			// Perform the matrix multiplication
+		  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+		}
+		// Store the output
+  	wmma::store_matrix_sync(wmma_c, c_frag, WMMA_N, wmma::mem_col_major);
+	}}
+	// Copy (tm,tn) tile from wmma_c to sm_c
+	...
 	__syncthreads();
-	
+
+// Store result to global memory
 	c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
 
 }
@@ -175,7 +192,7 @@ int main(int argc, char* argv[]) {
 
 	// blockDim.x must be a multple of warpSize
 	// 128x4 means we have 16 warps and a block computes a 64x64 output tile
-	blockDim.x = 16;
+	blockDim.x = 32;
 	blockDim.y = MATRIX_M;
 
 	gridDim.x = (MATRIX_N + blockDim.x-1) / blockDim.x;
