@@ -54,16 +54,16 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 	
 	int global_n = blockIdx.x*blockDim.x+threadIdx.x;
 
-	half* sm_a = ((half*)sm)+16*16*4;
+	half* sm_a = (half*)sm;
 	half* sm_b = sm_a + M*K;
-	half* sm_c = sm_b + M*K;
+	float* sm_c = (float*)(sm_b + M*K);
 
 	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
   wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-  wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
 
   // Initialize the output to zero
-  wmma::fill_fragment(c_frag, (half)0.0f);
+  wmma::fill_fragment(c_frag, 0.0f);
 
 	if(threadIdx.x == 0){
 		for(int k = 0; k < blockDim.y; k++){
@@ -183,7 +183,7 @@ int main(int argc, char* argv[]) {
 
 	printf("Running with wmma...\n");
 	cudaErrCheck(cudaEventRecord(startWMMA));
-	wmma_example <<< gridDim, blockDim, 16*16*2*8 >>> (a_fp16, b_fp16, c_wmma, 16, 16, 16, alpha, beta);
+	wmma_example <<< gridDim, blockDim, 16*16*2*4 >>> (a_fp16, b_fp16, c_wmma, 16, 16, 16, alpha, beta);
 	cudaErrCheck(cudaEventRecord(stopWMMA));
 
 
@@ -211,7 +211,7 @@ int main(int argc, char* argv[]) {
 	for (int i = 0; i < MATRIX_M * MATRIX_N; i++) {
 		float v1 = c_host_wmma[i];
 		float v2 = c_host_cublas[i];
-		if (v1 / v2 > 1.01 || v2 / v1 > 1.01 || abs(v1 - v2) > 1e-2) {
+		if (v1 / v2 > 1.0001 || v2 / v1 > 1.0001 || abs(v1 - v2) > 1e-5) {
 			errors++;
 			if (errors < 300) printf("%06d %f %f\n", i, v1, v2);
 		}
