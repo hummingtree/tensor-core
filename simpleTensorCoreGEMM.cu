@@ -24,15 +24,17 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
   }
 }
 
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/wmma_gemm_traits.h>
 
 #include <mma.h>
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M 48 // 12 x 4
-#define MATRIX_N 16*12*12*12 // 16x12x12x12
+#define MATRIX_M 16 // 12 x 4
+#define MATRIX_N 32*12*12*12 // 16x12x12x12
 //#define MATRIX_N 16 // 16x12x12x12
-#define MATRIX_K 48 // MATRIX_M
+#define MATRIX_K 16 // MATRIX_M
 
 // The only dimensions currently supported by WMMA
 const int WMMA_M = 16;
@@ -73,9 +75,9 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
   half* sm_b = sm_a + M*K;
   float* sm_c = (float*)(sm_b + K*N);
 
-  half* wmma_a = (half*)(sm_c + M*N);
-  half* wmma_b = wmma_a + WMMA_M*WMMA_K;
-  float* wmma_c = (float*)(wmma_b + WMMA_K*WMMA_N);
+//  half* wmma_a = (half*)(sm_c + M*N);
+//  half* wmma_b = wmma_a + WMMA_M*WMMA_K;
+//  float* wmma_c = (float*)(wmma_b + WMMA_K*WMMA_N);
 
   // Copy stuff from global memory to shared memory.
   int global_n = blockIdx.x*blockDim.x+threadIdx.x;
@@ -93,53 +95,83 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 
   __syncthreads();
 
-  //  sm_c[threadIdx.x*blockDim.y+threadIdx.y] = 0.;
-  //  for(int k = 0; k < blockDim.y; k++){
-  //    sm_c[threadIdx.x*blockDim.y+threadIdx.y] += float(sm_a[k*blockDim.y+threadIdx.y]*sm_b[threadIdx.x*blockDim.y+k]);
-  //  }
+// Retard version
+
+//  sm_c[threadIdx.x*blockDim.y+threadIdx.y] = 0.;
+//  for(int k = 0; k < blockDim.y; k++){
+//    sm_c[threadIdx.x*blockDim.y+threadIdx.y] += float(sm_a[k*blockDim.y+threadIdx.y]*sm_b[threadIdx.x*blockDim.y+k]);
+//  }
 
   __syncthreads();
+
+// CUTLASS version. Broken.
+/*
+  typedef cutlass::gemm::WmmaGemmTraits<
+    cutlass::MatrixLayout::kColumnMajor,
+    cutlass::MatrixLayout::kColumnMajor, 
+    cutlass::Shape<32, 32, 32> // K by N by M
+  > WmmaGemmTraits;
+
+  typedef cutlass::gemm::Gemm<WmmaGemmTraits> Gemm;
+  __shared__ typename Gemm::SharedStorage shared_storage;
+
+  typename Gemm::Params params;
+  
+  params.initialize( 32, 32, 32, alpha, sm_a, 32, sm_b, 32, beta, sm_c, 32, sm_c, 32 );
+  
+  Gemm gemm(params, shared_storage);
+  gemm.multiply_add();
+*/
+
+// WMMA version.
+
+  // The actual/physical warp assigned to each thread in this block
+  int phys_warp_n_dim = blockDim.x/warpSize;
+  int phys_warp_m_dim = blockDim.y;
+
+  int phys_warp_n = threadIdx.x/warpSize;
+  int phys_warp_m = threadIdx.y; 
+
+  int phys_warp_index = phys_warp_n*phys_warp_m_dim+phys_warp_m;
+
+  // The logical warp assigned to each part of the matrix.
+  int warp_n = phys_warp_index / tm_dim;
+  int warp_m = phys_warp_index % tm_dim;
 
   // Set up the wmma stuff
   wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
   wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-  for( int tm = 0; tm < tm_dim; tm++ ){
-  for( int tn = 0; tn < tn_dim; tn++ ){
-    // Initialize the output to zero
-    wmma::fill_fragment(c_frag, 0.0f);
-    // for this particular tile, loop over k
-    for( int tk = 0; tk < tk_dim; tk++ ){
+  // Zero the initial acc.
+  wmma::fill_fragment(c_frag, 0.0f);
+  
+  for( int k = 0; k < K; k+=WMMA_K ){
+    int a_row = warp_m*WMMA_M;
+    int a_col = k;
 
-      // Copy (tm,tk) tile from sm_a to wmma_a
-      if( threadIdx.y >= tk*WMMA_K && threadIdx.y < (tk+1)*WMMA_K && threadIdx.x == 0 ){
-        memcpy( wmma_a+(threadIdx.y-tk*WMMA_K)*WMMA_M, sm_a+threadIdx.y*M+tm*WMMA_M, WMMA_M*sizeof(half) );
-      }
-      // Copy (tk,tn) tile from sm_b to wmma_b
-      if( threadIdx.x >= tn*WMMA_N && threadIdx.x < (tn+1)*WMMA_N && threadIdx.y == 0 ){
-        memcpy( wmma_b+(threadIdx.x-tn*WMMA_N)*WMMA_K, sm_b+threadIdx.x*K+tk*WMMA_K, WMMA_K*sizeof(half) );
-      }
-      __syncthreads();
-
-      // Load the inputs
-      wmma::load_matrix_sync(a_frag, wmma_a, WMMA_M);
-      wmma::load_matrix_sync(b_frag, wmma_b, WMMA_K);
+    int b_row = k;
+    int b_col = warp_n*WMMA_N;
+    
+    if(a_row < M && a_col < K && b_row < K && b_col < N) {    
+      // Load Matrix
+      wmma::load_matrix_sync(a_frag, sm_a+a_row+a_col*M, M);
+      wmma::load_matrix_sync(b_frag, sm_b+b_row+b_col*K, K);
       // Perform the matrix multiplication
       wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
     }
-    // Store the output
-    wmma::store_matrix_sync(wmma_c, c_frag, WMMA_N, wmma::mem_col_major);
     __syncthreads();
-    // Copy (tm,tn) tile from wmma_c to sm_c
-    if( threadIdx.x >= tn*WMMA_N && threadIdx.x < (tn+1)*WMMA_N && threadIdx.y == 0 ){
-      memcpy( sm_c+threadIdx.x*M+tm*WMMA_M, wmma_c+(threadIdx.x-tn*WMMA_N)*WMMA_M, WMMA_M*sizeof(float) );
-    }
-    __syncthreads();
-
-  }}
-
+  } 
+  
   __syncthreads();
 
+  int c_row = warp_m*WMMA_M;
+  int c_col = warp_n*WMMA_N;
+  
+  if(c_row < M && c_col < N){ 
+    wmma::store_matrix_sync(sm_c+c_row+c_col*M, c_frag, M, wmma::mem_col_major);
+  }
+
+  __syncthreads();
   // Store result to global memory
   //  c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
   c[global_n*blockDim.y+threadIdx.y] = sm_c[threadIdx.x*blockDim.y+threadIdx.y];
@@ -267,11 +299,11 @@ int main(int argc, char* argv[]) {
     float v2 = c_host_cublas[i];
     if (v1 / v2 > 1.0001 || v2 / v1 > 1.0001 || abs(v1 - v2) > 1e-5) {
       errors++;
-      if (errors < 0) printf("%06d %f %f\n", i, v1, v2);
+      if (errors < 64) printf("%06d %f %f\n", i, v1, v2);
     }
   }
 
-  if (errors < 0) {
+  if (errors > 0) {
     printf("WMMA does not agree with cuBLAS! %d errors!\n", errors);
   }
   else {
