@@ -29,15 +29,29 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M 48 // 12 x 4
+#define MATRIX_M 16 // 12 x 4
 #define MATRIX_N 16*12*12*12 // 16x12x12x12
 //#define MATRIX_N 16 // 16x12x12x12
-#define MATRIX_K 48 // MATRIX_M
+#define MATRIX_K 16 // MATRIX_M
 
 // The only dimensions currently supported by WMMA
 const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
+
+//template< class hf >
+//__forceinline __device__ void crop_tile(hf* to, hf* from,
+//													const int& col,
+//													const int& t_row, 				const int& t_col, 
+//													cosnt int& row_dim, 			const int& col_dim // column major
+//													const int& wmma_row_dim, 	const int& wmma_col_dim)
+//{
+////	for(int col = t_col*wmma_col_dim; col < (t_col+1)*wmma_col_dim; col++){
+//		memcpy( to+(col-t_col*wmma_col_dim)*wmma_row_dim, 
+//						from+col*row_dim+t_row*wmma_row_dim, 
+//						wmma_row_dim*sizeof(hf) );
+////	}
+//}
 
 // Performs an MxNxK GEMM (C=alpha*A*B + beta*C) assuming:
 //  1) Matrices are packed in memory.
@@ -79,32 +93,51 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 	
 	__syncthreads();
 
-// Set up the wmma stuff
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
-  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-	for( int tm = 0; tm < tm_dim; tm++ ){
-	for( int tn = 0; tn < tn_dim; tn++ ){
-		// Initialize the output to zero
-  	wmma::fill_fragment(c_frag, 0.0f);
-		// for this particular tile, loop over k
-		for( int tk = 0; tk < tk_dim; tk++ ){
-			// Copy (tm,tk) tile from sm_a to wmma_a
-			...
-			// Copy (tk,tn) tile from sm_b to wmma_b
-			...
-			// Load the inputs
-		  wmma::load_matrix_sync(a_frag, wmma_a, WMMA_M);
-		  wmma::load_matrix_sync(b_frag, wmma_b, WMMA_K);
-			// Perform the matrix multiplication
-		  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-		}
-		// Store the output
-  	wmma::store_matrix_sync(wmma_c, c_frag, WMMA_N, wmma::mem_col_major);
-	}}
-	// Copy (tm,tn) tile from wmma_c to sm_c
-	...
+	sm_c[threadIdx.x*blockDim.y+threadIdx.y] = 0.;
+	for(int k = 0; k < blockDim.y; k++){
+		sm_c[threadIdx.x*blockDim.y+threadIdx.y] += float(sm_a[k*blockDim.y+threadIdx.y]*sm_b[threadIdx.x*blockDim.y+k]);
+	}
+	
 	__syncthreads();
+
+//// Set up the wmma stuff
+//	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
+//  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+//  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+//	for( int tm = 0; tm < tm_dim; tm++ ){
+//	for( int tn = 0; tn < tn_dim; tn++ ){
+//		// Initialize the output to zero
+//  	wmma::fill_fragment(c_frag, 0.0f);
+//		// for this particular tile, loop over k
+//		for( int tk = 0; tk < tk_dim; tk++ ){
+//			
+//			// Copy (tm,tk) tile from sm_a to wmma_a
+//			if( threadIdx.y >= tk*WMMA_K && threadIdx.y < (tk+1)*WMMA_K && threadIdx.x == 0 ){
+//				memcpy( wmma_a+(threadIdx.y-tk*WMMA_K)*WMMA_M, sm_a+threadIdx.y*M+tm*WMMA_M, WMMA_M*sizeof(half) );
+//			}
+//			// Copy (tk,tn) tile from sm_b to wmma_b
+//			if( threadIdx.x >= tn*WMMA_N && threadIdx.x < (tn+1)*WMMA_N && threadIdx.y == 0 ){
+//				memcpy( wmma_b+(threadIdx.x-tn*WMMA_N)*WMMA_K, sm_b+threadIdx.x*K+tk*WMMA_K, WMMA_K*sizeof(half) );
+//			}
+//			__syncthreads();
+//			
+//			// Load the inputs
+//		  wmma::load_matrix_sync(a_frag, wmma_a, WMMA_M);
+//		  wmma::load_matrix_sync(b_frag, wmma_b, WMMA_K);
+//			// Perform the matrix multiplication
+//		  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+//		}
+//		// Store the output
+//  	wmma::store_matrix_sync(wmma_c, c_frag, WMMA_N, wmma::mem_col_major);
+//		// Copy (tm,tn) tile from wmma_c to sm_c
+//		if( threadIdx.x >= tn*WMMA_N && threadIdx.x < (tn+1)*WMMA_N && threadIdx.y == 0 ){
+//			memcpy( sm_c+threadIdx.x*M+tm*WMMA_M, wmma_c+(threadIdx.x-tn*WMMA_N)*WMMA_M, WMMA_M*sizeof(float) );
+//		}
+//		__syncthreads();
+//	
+//	}}
+//	
+//	__syncthreads();
 
 // Store result to global memory
 //	c[threadIdx.y*blockDim.x*gridDim.x+global_n] = sm_c[threadIdx.y*blockDim.x+threadIdx.x];
@@ -202,7 +235,8 @@ int main(int argc, char* argv[]) {
 
 	printf("Running with wmma...\n");
 	cudaErrCheck(cudaEventRecord(startWMMA));
-	wmma_example <<< gridDim, blockDim, 16*16*2*4 >>> (a_fp16, b_fp16, c_wmma, 16, 16, 16, alpha, beta);
+	int shared_memory_size = blockDim.y*blockDim.y*2+blockDim.y*blockDim.x*2+blockDim.y*blockDim.x*4;
+	wmma_example <<< gridDim, blockDim, shared_memory_size*2 >>> (a_fp16, b_fp16, c_wmma, blockDim.y, blockDim.x, blockDim.y, alpha, beta);
 	cudaErrCheck(cudaEventRecord(stopWMMA));
 
 
@@ -230,7 +264,7 @@ int main(int argc, char* argv[]) {
 	for (int i = 0; i < MATRIX_M * MATRIX_N; i++) {
 		float v1 = c_host_wmma[i];
 		float v2 = c_host_cublas[i];
-		if (v1 / v2 > 1.0001 || v2 / v1 > 1.0001 || abs(v1 - v2) > 1e-5) {
+		if (v1 / v2 > 1.01 || v2 / v1 > 1.01 || abs(v1 - v2) > 1e-2) {
 			errors++;
 			if (errors < 300) printf("%06d %f %f\n", i, v1, v2);
 		}
