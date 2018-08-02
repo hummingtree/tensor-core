@@ -24,13 +24,15 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 	}
 }
 
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/wmma_gemm_traits.h>
 
 #include <mma.h>
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
 #define MATRIX_M 48 // 12 x 4
-#define MATRIX_N 16*12*12*12 // 16x12x12x12
+#define MATRIX_N 48*12*12*12 // 16x12x12x12
 //#define MATRIX_N 16 // 16x12x12x12
 #define MATRIX_K 48 // MATRIX_M
 
@@ -48,20 +50,20 @@ const int WMMA_K = 16;
 __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta) {
 	
 // M, N, K are the block-wise matrix dim.
-	int tm_dim = M/WMMA_M; // tile dimension in m.
-	int tn_dim = N/WMMA_N;
-	int tk_dim = K/WMMA_K;
+//	int tm_dim = M/WMMA_M; // tile dimension in m.
+//	int tn_dim = N/WMMA_N;
+//	int tk_dim = K/WMMA_K;
 
 // Declare all shared memory.
 	extern __shared__ float4 sm[];
 
-	half* sm_a = (half*)sm;
+	half* sm_a = ((half*)sm)+48*48*4;
 	half* sm_b = sm_a + M*K;
 	float* sm_c = (float*)(sm_b + K*N);
 
-	half* wmma_a = (half*)(sm_c + M*N);
-	half* wmma_b = wmma_a + WMMA_M*WMMA_K;
-	float* wmma_c = (float*)(wmma_b + WMMA_K*WMMA_N);
+//	half* wmma_a = (half*)(sm_c + M*N);
+//	half* wmma_b = wmma_a + WMMA_M*WMMA_K;
+//	float* wmma_c = (float*)(wmma_b + WMMA_K*WMMA_N);
 
 // Copy stuff from global memory to shared memory.
 	int global_n = blockIdx.x*blockDim.x+threadIdx.x;
@@ -79,31 +81,27 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
 	
 	__syncthreads();
 
-// Set up the wmma stuff
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
-  wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-  wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-	for( int tm = 0; tm < tm_dim; tm++ ){
-	for( int tn = 0; tn < tn_dim; tn++ ){
-		// Initialize the output to zero
-  	wmma::fill_fragment(c_frag, 0.0f);
-		// for this particular tile, loop over k
-		for( int tk = 0; tk < tk_dim; tk++ ){
-			// Copy (tm,tk) tile from sm_a to wmma_a
-			...
-			// Copy (tk,tn) tile from sm_b to wmma_b
-			...
-			// Load the inputs
-		  wmma::load_matrix_sync(a_frag, wmma_a, WMMA_M);
-		  wmma::load_matrix_sync(b_frag, wmma_b, WMMA_K);
-			// Perform the matrix multiplication
-		  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-		}
-		// Store the output
-  	wmma::store_matrix_sync(wmma_c, c_frag, WMMA_N, wmma::mem_col_major);
-	}}
-	// Copy (tm,tn) tile from wmma_c to sm_c
-	...
+	typedef cutlass::gemm::WmmaGemmTraits<
+		cutlass::MatrixLayout::kColumnMajor,
+		cutlass::MatrixLayout::kColumnMajor, 
+		cutlass::Shape<48, 32, 48>, // K by N by M
+		float,
+    cutlass::gemm::LinearScaling<float>,
+    float,
+    cutlass::Shape<48, 32, 48>, 
+    cutlass::Shape<16, 8, 32> 
+	> WmmaGemmTraits;
+
+	typedef cutlass::gemm::Gemm<WmmaGemmTraits> Gemm;
+	__shared__ typename Gemm::SharedStorage shared_storage;
+
+	typename Gemm::Params params;
+	
+	params.initialize( 48, 32, 48, alpha, sm_a, 48, sm_b, 32, beta, sm_c, 32, sm_c, 32 );
+	
+	Gemm gemm(params, shared_storage);
+	gemm.multiply_add();
+
 	__syncthreads();
 
 // Store result to global memory
@@ -194,7 +192,7 @@ int main(int argc, char* argv[]) {
 
 	// blockDim.x must be a multple of warpSize
 	// 128x4 means we have 16 warps and a block computes a 64x64 output tile
-	blockDim.x = 32;
+	blockDim.x = 64;
 	blockDim.y = MATRIX_M;
 
 	gridDim.x = (MATRIX_N + blockDim.x-1) / blockDim.x;
@@ -202,7 +200,7 @@ int main(int argc, char* argv[]) {
 
 	printf("Running with wmma...\n");
 	cudaErrCheck(cudaEventRecord(startWMMA));
-	wmma_example <<< gridDim, blockDim, 16*16*2*4 >>> (a_fp16, b_fp16, c_wmma, 16, 16, 16, alpha, beta);
+	wmma_example <<< gridDim, blockDim, 48*48*2*4*8 >>> (a_fp16, b_fp16, c_wmma, 48, 48, 32, alpha, beta);
 	cudaErrCheck(cudaEventRecord(stopWMMA));
 
 
